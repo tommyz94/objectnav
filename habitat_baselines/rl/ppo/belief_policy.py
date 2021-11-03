@@ -78,12 +78,15 @@ class MultipleBeliefCore(SingleBeliefCore):
     def __init__(
         self,
         num_tasks=None,
+        sem_num_tasks=None,
         fusion_obs_index=0,
         num_modules=-1,
         **kwargs
     ):
         self.num_tasks = num_tasks
         self.num_modules = num_tasks if num_modules == -1 else num_modules
+        self.num_sem_tasks = sem_num_tasks
+        self.num_sem_modules = sem_num_tasks
         self.fusion_obs_index = fusion_obs_index
         super().__init__(**kwargs)
         self._initialize_fusion_net()
@@ -95,7 +98,12 @@ class MultipleBeliefCore(SingleBeliefCore):
 
     def _initialize_state_encoder(self):
         self.state_encoders = nn.ModuleList([
-            RNNStateEncoder(self._embedding_size, self._hidden_size) for _ in range(self.num_modules)
+            RNNStateEncoder(self._embedding_size, self._hidden_size) for _ in
+            range(self.num_modules)
+        ])
+        self.sem_state_encoders = nn.ModuleList([
+            RNNStateEncoder(self._embedding_size, self._hidden_size) for _ in
+            range(self.num_sem_modules)
         ])
 
     # def set_streams(self, streams):
@@ -117,6 +125,16 @@ class MultipleBeliefCore(SingleBeliefCore):
         """
         pass
 
+    @abc.abstractmethod
+    def _fuse_sem_beliefs(self, beliefs, obs):
+        r"""
+            Fusion step. Batch may or may not have time flattened.
+            Args:
+                beliefs: batch x module x hidden. b x k x h
+                obs: b x h
+        """
+        pass
+
     def _step_rnn(self, obs, rnn_hidden_states, masks):
         r"""
             obs: b x k x h
@@ -130,6 +148,39 @@ class MultipleBeliefCore(SingleBeliefCore):
         embeddings = []
         all_states = []
         for i, encoder in enumerate(self.state_encoders):
+            enc_embed, enc_state = encoder(obs[..., i, :],
+                                           rnn_hidden_states[:, :, i], masks)
+            embeddings.append(enc_embed)
+            all_states.append(enc_state)
+
+        # if self.cuda_streams is None:
+        #     outputs = [encoder(obs, rnn_hidden_states[:, :, i], masks) for i, encoder in enumerate(self.state_encoders)]
+        # else:
+        #     outputs = [None] * self.num_tasks
+        #     torch.cuda.synchronize()
+        #     for i, encoder in enumerate(self.state_encoders):
+        #         with torch.cuda.stream(self.cuda_streams[i]):
+        #             outputs[i] = encoder(obs, rnn_hidden_states[:, :, i], masks)
+        #     torch.cuda.synchronize()
+        # embeddings, rnn_hidden_states = zip(*outputs) # b x h, n x h
+        beliefs = torch.stack(embeddings, dim=-2)  # b x k x h
+        rnn_hidden_states = torch.stack(all_states, dim=-2)  # n x k x h
+        # rnn_hidden_states = torch.stack(rnn_hidden_states, dim=-2) # n x k x h
+        return beliefs, rnn_hidden_states
+
+    def _step_sem_rnn(self, obs, rnn_hidden_states, masks):
+        r"""
+            obs: b x k x h
+
+            Step recurrent state through `obs`.
+            Returns:
+                beliefs - b x k x h
+                rnn_hidden_states - l x n x k x h (or n x k x h?)
+                masks - b x 1
+        """
+        embeddings = []
+        all_states = []
+        for i, encoder in enumerate(self.sem_state_encoders):
             enc_embed, enc_state = encoder(obs[..., i, :], rnn_hidden_states[:, :, i], masks)
             embeddings.append(enc_embed)
             all_states.append(enc_state)
@@ -149,7 +200,7 @@ class MultipleBeliefCore(SingleBeliefCore):
         # rnn_hidden_states = torch.stack(rnn_hidden_states, dim=-2) # n x k x h
         return beliefs, rnn_hidden_states
 
-    def forward(self, obs, rnn_hidden_states, masks):
+    def forward(self, obs, rnn_hidden_states, sem_rnn_hidden_states, masks):
         r"""
             Roll forward the recurrent core.
             Args:
@@ -159,8 +210,11 @@ class MultipleBeliefCore(SingleBeliefCore):
         # Ok, now they're different observations... what do
         obs = self.input_drop(obs)
         beliefs, rnn_hidden_states = self._step_rnn(obs, rnn_hidden_states, masks)
+        sem_beliefs, sem_rnn_hidden_states = self._step_sem_rnn(obs, sem_rnn_hidden_states, masks)
         contextual_embedding, weights = self._fuse_beliefs(beliefs, obs[:, self.fusion_obs_index])
-        return contextual_embedding, rnn_hidden_states, beliefs, weights
+        sem_contextual_embedding, sem_weights = self._fuse_sem_beliefs(sem_beliefs, obs[:, self.fusion_obs_index])
+        return contextual_embedding, sem_contextual_embedding, rnn_hidden_states,\
+               sem_rnn_hidden_states, beliefs, sem_beliefs, weights, sem_weights
 
 class AttentiveBeliefCore(MultipleBeliefCore):
     def _initialize_fusion_net(self):
@@ -170,10 +224,24 @@ class AttentiveBeliefCore(MultipleBeliefCore):
         self.fusion_key = nn.Linear(
             self._embedding_size, self._hidden_size
         )
+        self.sem_fusion_key = nn.Linear(
+            self._embedding_size, self._hidden_size
+        )
         self.scale = math.sqrt(self._hidden_size)
 
     def _fuse_beliefs(self, beliefs, obs):
-        key = self.fusion_key(obs) # .unsqueeze(-2)) # b x 1 x h
+        key = self.fusion_key(obs)  # .unsqueeze(-2)) # b x 1 x h
+        scores = torch.bmm(beliefs, key.unsqueeze(-1)) / self.scale
+        # scores = torch.bmm(beliefs, key.transpose(1, 2)) / self.scale
+        weights = F.softmax(scores, dim=1).squeeze(
+            -1)  # n x k (logits) x 1 -> (txn) x k
+        # n x 1 x k x n x k x h
+        contextual_embedding = torch.bmm(weights.unsqueeze(1),
+                                         beliefs).squeeze(1)  # txn x h
+        return contextual_embedding, weights
+
+    def _fuse_sem_beliefs(self, beliefs, obs):
+        key = self.sem_fusion_key(obs) # .unsqueeze(-2)) # b x 1 x h
         scores = torch.bmm(beliefs, key.unsqueeze(-1)) / self.scale
         # scores = torch.bmm(beliefs, key.transpose(1, 2)) / self.scale
         weights = F.softmax(scores, dim=1).squeeze(-1) # n x k (logits) x 1 -> (txn) x k
@@ -231,6 +299,7 @@ class BeliefPolicy(Policy):
         hidden_size=None,
         net=SingleBeliefCore,
         num_tasks=0,
+        sem_num_tasks=0,
         goal_sensor_uuid=None,
         additional_sensors=[],
         embed_goal=False,
@@ -265,6 +334,7 @@ class BeliefPolicy(Policy):
 
         # * Obs - belief mapping
         self.num_tasks = num_tasks
+        self.sem_num_tasks = sem_num_tasks
         self.obs_belief_map = config.BELIEFS.ENCODERS # an array of sensor requirements for each module (only used in multiplebelief)
         if len(self.obs_belief_map) < self.num_tasks: # we assume "all"
             self.obs_belief_map = ["all"] * self.num_tasks
@@ -278,6 +348,7 @@ class BeliefPolicy(Policy):
                 embedding_size=embedding_size,
                 config=config, # ! Get rid of this so we can JIT.
                 num_tasks=num_tasks,
+                sem_num_tasks=sem_num_tasks,
                 num_modules=config.BELIEFS.NUM_BELIEFS,
                 fusion_obs_index=fusion_obs_index,
                 input_drop=config.input_drop,
@@ -479,13 +550,15 @@ class BeliefPolicy(Policy):
         self,
         observations: Dict[str, torch.Tensor],
         rnn_hidden_states,
+        sem_rnn_hidden_states,
         prev_actions,
         masks,
     ):
         obs, _ = self.get_observations_for_beliefs(observations, prev_actions)
-        features, *_ = self.net(
-            obs, rnn_hidden_states, masks
+        features, sem_features, *_ = self.net(
+            obs, rnn_hidden_states, sem_rnn_hidden_states, masks
         )
+        features = torch.cat([features, sem_features], dim=1)
         features = self.output_drop(features)
         return self.critic(features)
 
@@ -504,6 +577,7 @@ class BeliefPolicy(Policy):
         self,
         observations: Dict[str, torch.Tensor],
         rnn_hidden_states,
+        rnn_sem_hidden_states,
         prev_actions,
         masks,
         action,
@@ -535,6 +609,7 @@ class BeliefPolicy(Policy):
         features, rnn_hidden_states = self.net(
             obs, rnn_hidden_states, masks
         )
+
         features = self.output_drop(features)
 
         value, action_log_probs, entropy = self.run_policy_evaluate_actions(features, action)
@@ -585,6 +660,7 @@ class MultipleBeliefPolicy(BeliefPolicy):
         self,
         observations: Dict[str, torch.Tensor],
         rnn_hidden_states,
+        rnn_sem_hidden_states,
         prev_actions,
         masks,
         deterministic=False,
@@ -598,9 +674,11 @@ class MultipleBeliefPolicy(BeliefPolicy):
             observations = self._preprocess_obs(observations)
         obs, obs_dict = self.get_observations_for_beliefs(observations, prev_actions) # dictionary of sensor to representations
 
-        features, rnn_hidden_states, _, weights = self.net(
-            obs, rnn_hidden_states, masks
+        features, sem_features, rnn_hidden_states, rnn_sem_hidden_states, _, _, \
+        weights, sem_weights = self.net(
+            obs, rnn_hidden_states, rnn_sem_hidden_states, masks
         )
+        features = torch.cat([features, sem_features], dim=1)
         features = self.output_drop(features)
 
         if weights_output is not None:
@@ -617,7 +695,7 @@ class MultipleBeliefPolicy(BeliefPolicy):
                 logits, # action logits
             )
         if return_features:
-            return value, actions, action_log_probs, rnn_hidden_states, obs_dict
+            return value, actions, action_log_probs, rnn_hidden_states, rnn_sem_hidden_states, obs_dict
         return value, actions, action_log_probs, rnn_hidden_states
 
     @torch.jit.export
@@ -625,6 +703,7 @@ class MultipleBeliefPolicy(BeliefPolicy):
         self,
         observations: Dict[str, torch.Tensor],
         rnn_hidden_states,
+        rnn_sem_hidden_states,
         prev_actions,
         masks,
         action,
@@ -655,25 +734,36 @@ class MultipleBeliefPolicy(BeliefPolicy):
         }
         obs = torch.stack([obs_dict[req] for req in self.obs_belief_map], dim=-2)
 
-        features, rnn_hidden_states, individual_features, weights = self.net(
-            obs, rnn_hidden_states, masks
-        )
+        # features, rnn_hidden_states, individual_features, weights = self.net(
+        #     obs, rnn_hidden_states, masks
+        # )
+        features, sem_features, rnn_hidden_states, rnn_sem_hidden_states, \
+        individual_features, individual_sem_features, weights, sem_weights = \
+            self.net(obs, rnn_hidden_states, rnn_sem_hidden_states, masks)
+        features = torch.cat([features, sem_features], dim=1)
         features = self.output_drop(features)
 
         value, action_log_probs, entropy = self.run_policy_evaluate_actions(features, action)
 
         aux_dist_entropy = None if weights is None else Categorical(weights).entropy().mean()
+        sem_aux_dist_entropy = None if sem_weights is None else Categorical(sem_weights).entropy().mean()
         weights = None if weights is None else weights.mean(dim=0) # sorry about this
+        sem_weights = None if sem_weights is None else sem_weights.mean(dim=0) # sorry about this
 
         return (
             value,
             action_log_probs,
             entropy,
             rnn_hidden_states,
+            rnn_sem_hidden_states,
             features,
+            sem_features,
             individual_features,
+            individual_sem_features,
             aux_dist_entropy,
+            sem_aux_dist_entropy,
             weights,
+            sem_weights,
             observations, # preprocessed
             vision,
             other,

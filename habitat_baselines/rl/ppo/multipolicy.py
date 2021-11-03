@@ -33,12 +33,12 @@ class MultiPolicyMixin(BeliefPolicy):
         self.stack_dim = -2
         # Overwrite
         self.action_distribution = StackedModules(
-            CategoricalNet(self.net.output_size, self.dim_actions),
+            CategoricalNet(self.net.output_size*2, self.dim_actions),
             copies=self.num_policy_heads,
             stack_dim=self.stack_dim
         )
         self.critic = StackedModules(
-            CriticHead(self.net.output_size),
+            CriticHead(self.net.output_size*2),
             copies=self.num_policy_heads,
             stack_dim=self.stack_dim
         )

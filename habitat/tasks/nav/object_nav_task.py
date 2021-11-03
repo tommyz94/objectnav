@@ -505,6 +505,128 @@ class GoalObjectVisible(Measure):
             self._metric = goal_visible_area
 
 
+@registry.register_sensor
+class RoomCategorySensor(Sensor):
+    r"""Region (room) and Level Information for probing agent location and whether they used stairs"""
+    cls_uuid: str = "roomcat"
+
+    def __init__(
+        self, sim, config: Config, dataset: Dataset, *args: Any, **kwargs: Any
+    ):
+        self._sim = sim
+        self._dataset = dataset
+        self.regions = None
+        import pickle
+        self._stats_dict = pickle.load(open('./pretrained_models/stats_dict.pkl', 'rb'))
+        self._found_any = False
+        super().__init__(config=config)
+
+    def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+        return self.cls_uuid
+
+    def _get_sensor_type(self, *args: Any, **kwargs: Any):
+        return SensorTypes.SEMANTIC
+
+    def _get_observation_space(self, *args: Any, **kwargs: Any):
+        sensor_shape = (1,)
+        max_value = 31
+        return spaces.Box(
+            low=0, high=max_value, shape=sensor_shape, dtype=np.int64
+        )
+    def _is_in(self, loc, sizes, center, extra_size=0.1):
+        sizes += extra_size
+        og_sizes = sizes / 2.0
+        sizes = [size for size in og_sizes]
+        #sizes += 0.1 # A little extra vertical buffer room since the agent tis positioned at ground
+        return all(
+            loc[i] > center[i] - sizes[i] and \
+                loc[i] < center[i] + sizes[i] for i in range(len(loc))
+        )
+
+    def get_observation(
+        self,
+        observations,
+        *args: Any,
+        episode: ObjectGoalNavEpisode,
+        **kwargs: Any,
+    ) -> Optional[int]:
+        stats = self._stats_dict[self._sim._current_scene.split('/')[-2]]
+        agent_position = self._sim.get_agent_state().position
+        for level in stats['levels']:
+            level_dict = stats['levels'][level]
+            center = np.array(level_dict['center'])
+            sizes  = np.array(level_dict['dims'])
+            if self._is_in(agent_position, sizes, center):
+                for region in level_dict['regions']:
+                    region_dict = level_dict['regions'][region]
+                    center = np.array(region_dict['center'])
+                    sizes = np.array(region_dict['dims'])
+                    if self._is_in(agent_position, sizes, center):
+                        category = region_dict['category']
+                        if category in REGION_ANNOTATIONS.keys():
+                            return np.array([REGION_ANNOTATIONS[category]])
+                        else:
+                            return np.array([30])
+        for level in stats['levels']:
+            level_dict = stats['levels'][level]
+            center = np.array(level_dict['center'])
+            sizes  = np.array(level_dict['dims'])
+            if self._is_in(agent_position, sizes, center, extra_size=0.6):
+                for region in level_dict['regions']:
+                    region_dict = level_dict['regions'][region]
+                    center = np.array(region_dict['center'])
+                    sizes = np.array(region_dict['dims'])
+                    if self._is_in(agent_position, sizes, center, extra_size=0.6):
+                        category = region_dict['category']
+                        if category in REGION_ANNOTATIONS.keys():
+                            return np.array([REGION_ANNOTATIONS[category]])
+                        else:
+                            return np.array([30])
+        return np.array([30])
+
+
+    # def reset_metric(self, episode, task, *args: Any, **kwargs: Any):
+    #     annot = self._sim.semantic_annotations()
+    #     # TODO check the containing logic -- we're getting very few hits..
+    #     # self.levels = {l.id: l.aabb for l in annot.levels}
+    #
+    #     if not self._found_any and self.regions is not None:
+    #         print(f"Didn't find any regions in {len(self.regions)}")
+    #     self._found_any = False
+    #
+    #     self.regions = {r.id: (r.aabb, r.category) for r in annot.regions}
+    #     self._metric = {
+    #         'room_cat': REGION_ANNOTATIONS['no label'],
+    #         # 'level_id': 100
+    #     }
+    #     self.update_metric(episode=episode, task=task, *args, **kwargs)
+    #
+    #
+    # def update_metric(
+    #     self,
+    #     episode,
+    #     task: EmbodiedTask,
+    #     observations,
+    #     *args: Any,
+    #     **kwargs: Any,
+    # ):
+    #     agent_position = self._sim.get_agent_state().position
+    #     room_cat = REGION_ANNOTATIONS['no label']
+    #     for r_id in self.regions:
+    #         if self._is_in(agent_position, self.regions[r_id][0]):
+    #             room_cat = REGION_ANNOTATIONS[self.regions[r_id][1].name()]
+    #             self._found_any = True
+    #             break
+    #     # level = 100
+    #     # for l_id in self.levels:
+    #     #     if self._is_in(agent_position, self.levels[l_id]):
+    #     #         level = l_id
+    #     #         break
+    #     print(room_cat)
+    #     self._metric = {
+    #         'room_cat': room_cat,
+    #         # 'level_id': int(level) # ! level annotations are flaky
+    #     }
 
 @registry.register_measure
 class RegionLevelInfo(Measure):
@@ -568,7 +690,7 @@ class RegionLevelInfo(Measure):
         #     if self._is_in(agent_position, self.levels[l_id]):
         #         level = l_id
         #         break
-
+        print(room_cat)
         self._metric = {
             'room_cat': room_cat,
             # 'level_id': int(level) # ! level annotations are flaky

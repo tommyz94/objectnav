@@ -959,6 +959,108 @@ class DistanceToGoal(Measure):
             self._previous_position = current_position
             self._metric = distance_to_target
 
+@registry.register_measure
+class RegionLevelInfo(Measure):
+    r"""Region (room) and Level Information for probing agent location and whether they used stairs"""
+    cls_uuid = "region_level"
+
+    def __init__(self, sim, config: Config, *args: Any, **kwargs: Any):
+        self._sim = sim
+        self._config = config
+        # self.levels = {}
+        self.regions = None
+
+        self._found_any = False
+        super().__init__()
+
+    def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+        return self.cls_uuid
+
+    def reset_metric(self, episode, task, *args: Any, **kwargs: Any):
+        annot = self._sim.semantic_annotations()
+        # TODO check the containing logic -- we're getting very few hits..
+        # self.levels = {l.id: l.aabb for l in annot.levels}
+
+        if not self._found_any and self.regions is not None:
+            print(f"Didn't find any regions in {len(self.regions)}")
+        self._found_any = False
+
+        self.regions = {r.id: (r.aabb, r.category) for r in annot.regions}
+        self._metric = {
+            'room_cat': REGION_ANNOTATIONS['no label'],
+            # 'level_id': 100
+        }
+        self.update_metric(episode=episode, task=task, *args, **kwargs)
+
+    def _is_in(self, loc, aabb):
+        og_sizes = aabb.sizes / 2.0
+        sizes = [size for size in og_sizes]
+        sizes[1] += 0.1 # A little extra vertical buffer room since the agent tis positioned at ground
+        return all(
+            loc[i] > aabb.center[i] - sizes[i] and \
+                loc[i] < aabb.center[i] + sizes[i] for i in range(len(loc))
+        )
+
+    def update_metric(
+        self,
+        episode,
+        task: EmbodiedTask,
+        observations,
+        *args: Any,
+        **kwargs: Any,
+    ):
+        agent_position = self._sim.get_agent_state().position
+        room_cat = REGION_ANNOTATIONS['no label']
+        for r_id in self.regions:
+            if self._is_in(agent_position, self.regions[r_id][0]):
+                room_cat = REGION_ANNOTATIONS[self.regions[r_id][1].name()]
+                self._found_any = True
+                break
+        # level = 100
+        # for l_id in self.levels:
+        #     if self._is_in(agent_position, self.levels[l_id]):
+        #         level = l_id
+        #         break
+
+        self._metric = {
+            'room_cat': room_cat,
+            # 'level_id': int(level) # ! level annotations are flaky
+        }
+
+# From https://github.com/niessner/Matterport/blob/master/data_organization.md
+REGION_ANNOTATIONS = {
+    'bathroom': 0,
+    'bedroom': 1,
+    'closet': 2,
+    'dining room': 3,
+    'entryway/foyer/lobby': 4, # (should be the front door, not any door)
+    'familyroom/lounge': 5, # (should be a room that a family hangs out in, not any area with couches)
+    'garage': 6,
+    'hallway': 7,
+    'library': 8, # (should be room like a library at a university, not an individual study)
+    'laundryroom/mudroom': 9, # (place where people do laundry, etc.)
+    'kitchen': 10,
+    'living room': 11, # (should be the main “showcase” living room in a house, not any area with couches)
+    'meetingroom/conferenceroom': 12,
+    'lounge': 13, # (any area where people relax in comfy chairs/couches that is not the family room or living room
+    'office': 14, # (usually for an individual, or a small set of people)
+    'porch/terrace/deck': 15, # (must be outdoors on ground level)
+    'rec/game': 16, # (should have recreational objects, like pool table, etc.)
+    'stairs': 17,
+    'toilet': 18, # (should be a small room with ONLY a toilet)
+    'utilityroom/toolroom': 19,
+    'tv': 20, # (must have theater-style seating)
+    'workout/gym/exercise': 21,
+    'outdoor': 22, # areas containing grass, plants, bushes, trees, etc.
+    'balcony': 23, # (must be outside and must not be on ground floor)
+    'other room': 24, # (it is clearly a room, but the function is not clear)
+    'bar': 25,
+    'classroom': 26,
+    'dining booth': 27,
+    'spa/sauna': 28,
+    'junk': 29, # (reflections of mirrors, random points floating in space, etc.)
+    'no label': 30
+}
 
 @registry.register_task_action
 class MoveForwardAction(SimulatorTaskAction):

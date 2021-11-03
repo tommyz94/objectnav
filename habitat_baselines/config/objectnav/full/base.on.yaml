@@ -7,7 +7,7 @@ BASE_TASK_CONFIG_PATH: "configs/tasks/objectnav_mp3d_full_train.yaml"
 EVAL:
 #   restrict_gps: False
   # SPLIT: "val_300"
-  SPLIT: "val_mini"
+  SPLIT: "val"
   # PROJECT_OUT: -1 # control
   # PROJECT_OUT: 0 # increase steps/coverage (low SPL)
   # PROJECT_OUT: 200 # = test 0 - 450. Center of mass is around prediction.

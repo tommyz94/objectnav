@@ -3,8 +3,10 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-
+import pickle
 from typing import Any, List, Optional, Type
+
+import numpy as np
 
 from habitat.config import Config
 from habitat.core.dataset import Episode, Dataset
@@ -70,6 +72,45 @@ class Coverage(Measure):
         self._mini_reached = None
         self._mini_delta = 0.5
         self._grid_delta = config.GRID_DELTA
+        self.priors = pickle.load(open('./pretrained_models/p_o1_o2.pkl', 'rb'))
+        self.MP3D_cat = [3, 5, 6, 7, 8, 10, 11, 13, 14, 15, 18, 19, 20, 22, 23,
+                         25, 26, 27, 33, 34, 38]
+        self.id_to_cat = {v: k for k, v in {"chair": 3, "table": 5, "picture": 6,
+                                         "cabinet": 7, "cushion": 8,
+                                         "sofa": 10, "bed": 11,
+                                         "chest_of_drawers": 13, "plant": 14,
+                                         "sink": 15, "toilet": 18, "stool": 19,
+                                         "towel": 20, "tv_monitor": 22,
+                                         "shower": 23, "bathtub": 25,
+                                         "counter": 26, "fireplace": 27,
+                                         "gym_equipment": 33, "seating": 34,
+                                         "clothes": 38}.items()}
+        self.objnav_to_id = {v: k for k, v in {"chair": 0, "table": 1,
+                                              "picture": 2, "cabinet": 3,
+                                              "cushion": 4, "sofa": 5,
+                                              "bed": 6, "chest_of_drawers": 7,
+                                              "plant": 8, "sink": 9,
+                                              "toilet": 10,
+                                              "stool": 11, "towel": 12,
+                                              "tv_monitor": 13, "shower": 14,
+                                              "bathtub": 15, "counter": 16,
+                                              "fireplace": 17,
+                                              "gym_equipment": 18,
+                                              "seating": 19, "clothes": 20
+                                              }.items()}
+        self.id_to_objnav = {"chair": 0, "table": 1,
+                                              "picture": 2, "cabinet": 3,
+                                              "cushion": 4, "sofa": 5,
+                                              "bed": 6, "chest_of_drawers": 7,
+                                              "plant": 8, "sink": 9,
+                                              "toilet": 10,
+                                              "stool": 11, "towel": 12,
+                                              "tv_monitor": 13, "shower": 14,
+                                              "bathtub": 15, "counter": 16,
+                                              "fireplace": 17,
+                                              "gym_equipment": 18,
+                                              "seating": 19, "clothes": 20
+                                              }
         super().__init__()
 
     def _get_uuid(self, *args: Any, **kwargs: Any):
@@ -82,20 +123,41 @@ class Coverage(Measure):
         grid_z = int((sim_z) / delta)
         return grid_x, grid_y, grid_z
 
+    def get_reward_for_current_obs(self, observations):
+        sem_objs = np.unique(observations['semantic'])
+        best_prob = 0.
+        objgoal_cat = self.objnav_to_id[observations['objectgoal'][0]]
+        for obj_id in sem_objs:
+            if obj_id in self.MP3D_cat:
+                obj_cat = self.id_to_cat[obj_id]
+                if obj_cat == objgoal_cat:
+                    return 0.1
+                rew = self.priors[obj_cat][objgoal_cat]
+                if rew > best_prob:
+                    best_prob = rew
+        return best_prob/10.
+
+
+
+
+
+
     def reset_metric(self, episode, task, observations, *args: Any, **kwargs: Any):
         # ! EGOCENTRIC will ASSUME sensor available
         self._visited = {}
+        self._visited_reward_value = {}
         self._mini_visited = {}
         self._reached_count = 0
         # Used for coverage prediction (not elegant, I know)
         self._mini_reached = 0
         self._step = 0  # Tracking episode length
-        current_visit = self._visit(task, observations)
+        current_visit, rew = self._visit(task, observations)
         self._metric = {
             "reached": self._reached_count,
             "mini_reached": self._mini_reached,
             "visit_count": current_visit,
-            "step": self._step
+            "step": self._step,
+            "curr_rew": rew
         }
 
     def _visit(self, task, observations):
@@ -114,22 +176,27 @@ class Coverage(Measure):
             self._mini_reached += 1
 
         grid_loc = self._to_grid(self._grid_delta, *global_loc)
+        rew = self.get_reward_for_current_obs(observations)
         if grid_loc in self._visited:
             self._visited[grid_loc] += 1
-            return self._visited[grid_loc]
+            self._visited_reward_value[grid_loc] = 0.1 + max(rew, self._visited_reward_value[grid_loc]-0.1)
+            return self._visited[grid_loc], self._visited_reward_value[grid_loc]
         self._visited[grid_loc] = 1
+        self._visited_reward_value[grid_loc] = 0.1 + rew
         self._reached_count += 1
-        return self._visited[grid_loc]
+        return self._visited[grid_loc], self._visited_reward_value[grid_loc]
 
     def update_metric(
         self, *args: Any, episode, action, task: EmbodiedTask, observations, **kwargs: Any
     ):
-        current_visit = self._visit(task, observations)
+        current_visit, rew = self._visit(task, observations)
+        #print(observations['semantic'])
         self._metric = {
             "reached": self._reached_count,
             "mini_reached": self._mini_reached,
             "visit_count": current_visit,
-            "step": self._step
+            "step": self._step,
+            "curr_rew": rew
         }
 
 
@@ -166,7 +233,10 @@ class CoverageExplorationReward(Measure):
         visit = task.measurements.measures[
             Coverage.cls_uuid
         ].get_metric()["visit_count"]
-        self._metric = self._attenuation_penalty * self._config.REWARD / (visit ** self._config.VISIT_EXP)
+        rew = task.measurements.measures[
+            Coverage.cls_uuid
+        ].get_metric()["curr_rew"]
+        self._metric = self._attenuation_penalty * rew / (visit ** self._config.VISIT_EXP)
 
 @registry.register_task(name="Coverage-v0")
 class CoverageTask(EmbodiedTask):

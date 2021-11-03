@@ -86,6 +86,7 @@ class PPO(nn.Module):
         use_clipped_value_loss=True,
         use_normalized_advantage=True,
         aux_tasks=[],
+        sem_aux_tasks=[],
         aux_cfg=None,
         aux_encoders={},
         aux_map=None,
@@ -115,6 +116,7 @@ class PPO(nn.Module):
         self.device = next(actor_critic.parameters()).device
         self.use_normalized_advantage = use_normalized_advantage
         self.aux_tasks = nn.ModuleList(aux_tasks)
+        self.sem_aux_tasks = nn.ModuleList(sem_aux_tasks)
         self.aux_encoders = nn.ModuleDict(aux_encoders) # it'd be nice to script these
         self.aux_cfg = aux_cfg
         self.aux_map = aux_map
@@ -156,12 +158,20 @@ class PPO(nn.Module):
             (task if isinstance(task, ActionDist) or isinstance(task, ActionDist_A) else torch.jit.script(task))\
                 for task in self.aux_tasks
         )
+        self.sem_aux_tasks = nn.ModuleList(
+            (task if isinstance(task, ActionDist) or isinstance(task,
+                                                                ActionDist_A) else torch.jit.script(
+                task)) \
+            for task in self.sem_aux_tasks
+        )
         # torch.jit.script(self.aux_tasks) doesn't work directly
         # self.actor_critic.visual_encoders.encoders = torch.jit.script(self.actor_critic.visual_encoders.encoders)
 
     def get_parameters(self):
         params = list(self.actor_critic.parameters())
         for task in self.aux_tasks:
+            params += list(task.parameters())
+        for task in self.sem_aux_tasks:
             params += list(task.parameters())
         for encoder in self.aux_encoders.values():
             params += list(encoder.parameters())
@@ -290,19 +300,87 @@ class PPO(nn.Module):
         # Going to take a gamble that our aux tasks are learned relatively stably, so we can use low precision
         with torch.cuda.amp.autocast(enabled=self._fp16_autocast):
             # aux embeddings are visual embeddings that are only used for auxiliary tasks
+            aux_embeddings = {k: encoder(sample[0]) for k, encoder in
+                              self.aux_encoders.items()}
+            vision_embeddings.update(aux_embeddings)
+
+            actions, metrics, n, t, env_zeros, vision_embeddings = self._shape_aux_inputs(
+                sample[3], sample[7], sample[9], final_rnn_state,
+                vision_embeddings
+            )
+
+            final_belief_state = final_rnn_state[
+                -1]  # * Only use top layer belief state
+            output_drop = self.actor_critic.output_drop
+
+            if self.actor_critic.IS_MULTIPLE_BELIEF:
+                losses = [None] * len(
+                    self.aux_tasks)  # In case we want to do something parallel
+                for i, task in enumerate(self.aux_tasks):
+                    get_belief_index = lambda j: self.aux_map[
+                        j] if self.aux_map else j
+                    losses[i] = \
+                        task.get_loss(
+                            observations,
+                            actions,
+                            vision_embeddings,
+                            final_belief_state[:,
+                            get_belief_index(i)].contiguous(),
+                            output_drop(individual_rnn_features[:,
+                                        get_belief_index(
+                                            i)]).contiguous().view(t, n, -1),
+                            metrics,
+                            n, t, env_zeros
+                        )
+            else:  # single belief
+                belief_features = rnn_features.view(t, n, -1)
+                belief_features = output_drop(belief_features)
+                losses = [task.get_loss(
+                    observations,
+                    actions,
+                    vision_embeddings,
+                    final_belief_state,
+                    belief_features,
+                    metrics,
+                    n, t, env_zeros
+                ) for task in self.aux_tasks]
+
+            aux_losses = torch.stack(losses)
+        return aux_losses, torch.sum(aux_losses, dim=0)
+
+    def get_sem_aux_losses(
+        self,
+        sample, observations,
+        vision_embeddings, other_embeddings,
+        final_rnn_state, rnn_features, individual_rnn_features
+    ):
+        r"""
+            Calculate auxiliary losses. Prepare observations, and pipes correctly.
+            args:
+                sample: rollout sample
+
+                There's a preprocess, and then we just directly pass to encoders.
+            returns:
+                individual and total aux loss
+        """
+        if not self.sem_aux_tasks:
+            return [], 0
+        # Going to take a gamble that our aux tasks are learned relatively stably, so we can use low precision
+        with torch.cuda.amp.autocast(enabled=self._fp16_autocast):
+            # aux embeddings are visual embeddings that are only used for auxiliary tasks
             aux_embeddings = { k: encoder(sample[0]) for k, encoder in self.aux_encoders.items() }
             vision_embeddings.update(aux_embeddings)
 
             actions, metrics, n, t, env_zeros, vision_embeddings = self._shape_aux_inputs(
-                sample[2], sample[6], sample[8], final_rnn_state, vision_embeddings
+                sample[3], sample[7], sample[9], final_rnn_state, vision_embeddings
             )
 
             final_belief_state = final_rnn_state[-1] # * Only use top layer belief state
             output_drop = self.actor_critic.output_drop
 
             if self.actor_critic.IS_MULTIPLE_BELIEF:
-                losses = [None] * len(self.aux_tasks) # In case we want to do something parallel
-                for i, task in enumerate(self.aux_tasks):
+                losses = [None] * len(self.sem_aux_tasks) # In case we want to do something parallel
+                for i, task in enumerate(self.sem_aux_tasks):
                     get_belief_index = lambda j: self.aux_map[j] if self.aux_map else j
                     losses[i] = \
                         task.get_loss(
@@ -325,7 +403,7 @@ class PPO(nn.Module):
                     belief_features,
                     metrics,
                     n, t, env_zeros
-                ) for task in self.aux_tasks]
+                ) for task in self.sem_aux_tasks]
 
             aux_losses = torch.stack(losses)
         return aux_losses, torch.sum(aux_losses, dim=0)
@@ -344,7 +422,10 @@ class PPO(nn.Module):
 
         aux_losses_epoch = [0] * len(self.aux_tasks)
         aux_entropy_epoch = 0
+        sem_aux_entropy_epoch = 0
         aux_weights_epoch = [0] * len(self.aux_tasks)
+        sem_aux_losses_epoch = [0] * len(self.sem_aux_tasks)
+        sem_aux_weights_epoch = [0] * len(self.sem_aux_tasks)
         inv_curiosity_epoch = 0
         fwd_curiosity_epoch = 0
         for e in range(self.ppo_epoch):
@@ -358,6 +439,7 @@ class PPO(nn.Module):
                     (
                         obs_batch,
                         recurrent_hidden_states_batch,
+                        recurrent_sem_hidden_states_batch,
                         actions_batch,
                         prev_actions_batch,
                         value_preds_batch,
@@ -372,17 +454,25 @@ class PPO(nn.Module):
                         values,
                         action_log_probs,
                         dist_entropy,
-                        final_rnn_state, # Used to encourage trajectory memory (it's the same as final rnn feature due to GRU)
+                        final_rnn_state,
+                        final_sem_rnn_state,
+                        # Used to encourage trajectory memory (it's the same as final rnn feature due to GRU)
                         rnn_features,
+                        rnn_sem_features,
                         individual_rnn_features,
+                        individual_sem_rnn_features,
+                        # Used to encourage trajectory memory (it's the same as final rnn feature due to GRU)
                         aux_dist_entropy,
+                        sem_aux_dist_entropy,
                         aux_weights,
+                        sem_aux_weights,
                         observations,
                         vision_embeddings,
                         other_embeddings,
                     ) = self.actor_critic.evaluate_actions(
                         obs_batch,
                         recurrent_hidden_states_batch,
+                        recurrent_sem_hidden_states_batch,
                         prev_actions_batch,
                         masks_batch,
                         actions_batch,
@@ -394,9 +484,13 @@ class PPO(nn.Module):
                         action_log_probs = action_log_probs.float()
                         dist_entropy = dist_entropy.float()
                         final_rnn_state = final_rnn_state.float()
+                        final_sem_rnn_state = final_sem_rnn_state.float()
                         rnn_features = rnn_features.float()
+                        rnn_sem_features = rnn_sem_features.float()
                         individual_rnn_features = individual_rnn_features.float()
+                        individual_sem_rnn_features = individual_sem_rnn_features.float()
                         aux_dist_entropy = aux_dist_entropy.float()
+                        sem_aux_dist_entropy = sem_aux_dist_entropy.float()
                         observations = { k: v.float() for k, v in observations.items() }
                         vision_embeddings = { k: v.float() for k, v in vision_embeddings.items() }
                         other_embeddings = [ v.float() for v in other_embeddings ]
@@ -464,15 +558,22 @@ class PPO(nn.Module):
                         vision_embeddings, other_embeddings,
                         final_rnn_state, rnn_features, individual_rnn_features,
                     )
+                    sem_aux_losses, total_sem_aux_loss = self.get_sem_aux_losses(
+                        sample, observations,
+                        vision_embeddings, other_embeddings,
+                        final_sem_rnn_state, rnn_sem_features, individual_sem_rnn_features,
+                    )
 
                     total_loss = (
                         value_loss * self.value_loss_coef
                         + action_loss
                         + total_aux_loss * self.aux_loss_coef
+                        +total_sem_aux_loss * self.aux_loss_coef
                         - dist_entropy_loss * self.entropy_coef
                     )
                     if aux_dist_entropy is not None:
                         total_loss -= aux_dist_entropy * self.aux_cfg.entropy_coef
+                        total_loss -= sem_aux_dist_entropy * self.aux_cfg.entropy_coef
 
                     if self.should_use_curiosity():
                         n = final_rnn_state.size(1)
@@ -511,11 +612,18 @@ class PPO(nn.Module):
                     dist_entropy_epoch += dist_entropy.cpu()
                     if aux_dist_entropy is not None:
                         aux_entropy_epoch += aux_dist_entropy.item()
+                    if sem_aux_dist_entropy is not None:
+                        sem_aux_entropy_epoch += sem_aux_dist_entropy.item()
                     for i, aux_loss in enumerate(aux_losses):
                         aux_losses_epoch[i] += aux_loss.item()
+                    for i, sem_aux_loss in enumerate(sem_aux_losses):
+                        sem_aux_losses_epoch[i] += sem_aux_loss.item()
                     if aux_weights is not None:
                         for i, aux_weight in enumerate(aux_weights):
                             aux_weights_epoch[i] += aux_weight.item()
+                    if sem_aux_weights is not None:
+                        for i, sem_aux_weight in enumerate(sem_aux_weights):
+                            sem_aux_weights_epoch[i] += sem_aux_weight.item()
                     if self.should_use_curiosity():
                         inv_curiosity_epoch += inv_curiosity_loss.item()
                         fwd_curiosity_epoch += fwd_curiosity_loss.item()
@@ -528,11 +636,18 @@ class PPO(nn.Module):
         dist_entropy_epoch /= num_updates
         for i, aux_loss in enumerate(aux_losses):
             aux_losses_epoch[i] /= num_updates
+        for i, sem_aux_loss in enumerate(sem_aux_losses):
+            sem_aux_losses_epoch[i] /= num_updates
         if aux_weights is not None:
             for i, aux_weight in enumerate(aux_weights):
                 aux_weights_epoch[i] /= num_updates
         else:
             aux_weights_epoch = None
+        if sem_aux_weights is not None:
+            for i, sem_aux_weight in enumerate(sem_aux_weights):
+                sem_aux_weights_epoch[i] /= num_updates
+        else:
+            sem_aux_weights_epoch = None
         if self.should_use_curiosity():
             inv_curiosity_epoch /= num_updates
             fwd_curiosity_epoch /= num_updates
@@ -542,8 +657,11 @@ class PPO(nn.Module):
             action_loss_epoch,
             dist_entropy_epoch,
             aux_losses_epoch,
+            sem_aux_losses_epoch,
             aux_entropy_epoch,
+            sem_aux_entropy_epoch,
             aux_weights_epoch,
+            sem_aux_weights_epoch,
             inv_curiosity_epoch,
             fwd_curiosity_epoch,
         )

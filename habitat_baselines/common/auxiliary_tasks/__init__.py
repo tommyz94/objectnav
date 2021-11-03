@@ -28,3 +28,4 @@ def get_aux_task_classes(cfg) -> Type[nn.Module]:
 from habitat_baselines.common.auxiliary_tasks.aux_utils import ACTION_EMBEDDING_DIM, RolloutAuxTask
 import habitat_baselines.common.auxiliary_tasks.supervised_auxiliary_tasks
 import habitat_baselines.common.auxiliary_tasks.auxiliary_tasks
+import habitat_baselines.common.auxiliary_tasks.semantic_auxiliary_tasks

@@ -106,14 +106,18 @@ class BeliefDDPPOTrainer(DDPPOTrainer):
         Initialize auxiliary tasks
         """
         aux_cfg = self.config.RL.AUX_TASKS
+        sem_aux_cfg = self.config.RL.SEM_AUX_TASKS
 
         init_aux_tasks, num_recurrent_memories, aux_task_strings, aux_encoder_insts = \
             self._setup_auxiliary_tasks(aux_cfg, ppo_cfg, task_cfg,
                 observation_space=self.obs_space, policy_encoders=policy_encoders_map)
-
+        init_sem_aux_tasks, num_sem_recurrent_memories, sem_aux_task_strings, sem_aux_encoder_insts = \
+            self._setup_semantic_auxiliary_tasks(sem_aux_cfg, ppo_cfg, task_cfg,
+                                        observation_space=self.obs_space,
+                                        policy_encoders=policy_encoders_map)
         self._setup_actor_critic_agent(
-            ppo_cfg, task_cfg, aux_cfg,
-            init_aux_tasks,
+            ppo_cfg, task_cfg, aux_cfg, sem_aux_cfg,
+            init_aux_tasks, init_sem_aux_tasks,
             aux_encoders=aux_encoder_insts,
             policy_encoders=policy_encoders_map
         )
@@ -126,6 +130,7 @@ class BeliefDDPPOTrainer(DDPPOTrainer):
             self.envs.action_spaces[0],
             ppo_cfg.hidden_size,
             num_recurrent_memories=num_recurrent_memories,
+            num_sem_recurrent_memories=num_sem_recurrent_memories,
             num_policy_heads=self._get_policy_head_count(),
             metrics=ppo_cfg.ROLLOUT.METRICS
         )
@@ -296,8 +301,11 @@ class BeliefDDPPOTrainer(DDPPOTrainer):
                     action_loss,
                     dist_entropy,
                     aux_task_losses,
+                    sem_aux_task_losses,
                     aux_dist_entropy,
+                    sem_aux_dist_entropy,
                     aux_weights,
+                    sem_aux_weights,
                     inv_curiosity,
                     fwd_curiosity,
                 ) = self._update_agent(ppo_cfg, rollouts)
@@ -325,8 +333,8 @@ class BeliefDDPPOTrainer(DDPPOTrainer):
                     window_episode_stats[k].append(not_reward_stats[i].clone())
 
                 stats = torch.tensor(
-                    [aux_dist_entropy, inv_curiosity, fwd_curiosity] +
-                    aux_task_losses + [count_steps_delta],
+                    [aux_dist_entropy, sem_aux_dist_entropy, inv_curiosity, fwd_curiosity] +
+                    aux_task_losses + sem_aux_task_losses + [count_steps_delta],
                     device=self.device,
                 )
                 distrib.all_reduce(stats)
@@ -340,14 +348,20 @@ class BeliefDDPPOTrainer(DDPPOTrainer):
                     distrib.all_reduce(aux_weights)
                     aux_weights = aux_weights / self.world_size
 
+                if sem_aux_weights is not None and len(sem_aux_weights) > 0:
+                    sem_aux_weights = torch.tensor(sem_aux_weights, device=self.device)
+                    distrib.all_reduce(sem_aux_weights)
+                    sem_aux_weights = sem_aux_weights / self.world_size
+
                 if self.world_rank == 0:
                     num_rollouts_done_store.set("num_done", "0")
 
                     avg_stats = [
                         stats[i].item() / self.world_size for i in range(len(stats) - 1)
                     ]
-                    aux_dist_entropy, inv_curiosity, fwd_curiosity = avg_stats[:3]
-                    aux_task_losses = avg_stats[3:]
+                    aux_dist_entropy, sem_aux_dist_entropy, inv_curiosity, fwd_curiosity = avg_stats[:4]
+                    aux_task_losses = avg_stats[4: 4+len(aux_task_strings)]
+                    sem_aux_task_losses = avg_stats[4+len(aux_task_strings):]
 
                     avg_entropy = per_head_stats[0] / self.world_size
                     losses = per_head_stats[1:]
@@ -356,12 +370,13 @@ class BeliefDDPPOTrainer(DDPPOTrainer):
 
                     self.report_train_metrics(writer, {
                         "aux_entropy": aux_dist_entropy,
+                        "sem_aux_entropy": sem_aux_dist_entropy,
                         "inv_curiosity_loss": inv_curiosity,
                         "fwd_curiosity_loss": fwd_curiosity,
                     },
-                        deltas, avg_entropy, losses, aux_task_losses, self.count_steps, elapsed_steps, update,
+                        deltas, avg_entropy, losses, aux_task_losses, sem_aux_task_losses, self.count_steps, elapsed_steps, update,
                         env_time, pth_time, t_start, window_episode_stats,
-                        aux_weights, aux_task_strings)
+                        aux_weights, sem_aux_weights, aux_task_strings, sem_aux_task_strings)
 
                     # checkpoint model
                     if update % self.config.CHECKPOINT_INTERVAL == 0:

@@ -1,16 +1,16 @@
-CHECKPOINT_FOLDER: "/srv/share/jye72/objectnav/"
+CHECKPOINT_FOLDER: "./ckpt/"
 LOG_FILE: "runs/objectnav/"
 TENSORBOARD_DIR: "tb/objectnav/"
-VIDEO_DIR: "/srv/share/jye72/vis/videos/objectnav/"
+VIDEO_DIR: "./vis/videos/objectnav/"
 
 BASE_TASK_CONFIG_PATH: "configs/tasks/objectnav_mp3d.yaml"
 SIMULATOR_GPU_ID: 0
 TORCH_GPU_ID: 0
 VIDEO_OPTION: []
-NUM_PROCESSES: 4
+NUM_PROCESSES: 2
 SENSORS: ["RGB_SENSOR", "DEPTH_SENSOR"]
 NUM_UPDATES: 100000
-LOG_INTERVAL: 50
+LOG_INTERVAL: 5
 CHECKPOINT_INTERVAL: 1000
 TEST_EPISODE_COUNT: 2184 # 312 # 2184 ~ 2 mins per episode - 500 steps, 250 / min, 4 fps???
 
@@ -38,11 +38,19 @@ RL:
       name: "BeliefPolicy"
       use_mean_and_var: True
       pretrained_encoder: True
-      pretrained_weights: "/srv/share/ewijmans3/resnet-18-mp3d-rgbd-100m.pth"
+      pretrained_weights: "/home/tc94/repository/objectnav/pretrained_models/split_rednet-full.37.pth"
       TRANSFORMER:
         num_heads: 4
         num_layers: 1
         dropout_p: 0.2
+  SEM_AUX_TASKS:
+    entropy_coef: 0.075
+    CPCS:
+      num_steps: 4
+    CPCS_A:
+        num_steps: 16
+    CPCS_B:
+        num_steps: 32
   AUX_TASKS:
     entropy_coef: 0.075
     CPCA:

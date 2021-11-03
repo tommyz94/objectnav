@@ -32,10 +32,10 @@ _C.VIDEO_OPTION = ["disk", "tensorboard"]
 _C.TENSORBOARD_DIR = "tb"
 _C.VIDEO_DIR = "video_dir"
 _C.TEST_EPISODE_COUNT = -1
-_C.EVAL_CKPT_PATH_DIR = "data/checkpoints"  # path to ckpt or path to ckpts dir
+_C.EVAL_CKPT_PATH_DIR = "ckpt"  # path to ckpt or path to ckpts dir
 _C.NUM_PROCESSES = 16
 _C.SENSORS = ["RGB_SENSOR", "DEPTH_SENSOR"]
-_C.CHECKPOINT_FOLDER = "data/checkpoints"
+_C.CHECKPOINT_FOLDER = "ckpt"
 _C.NUM_UPDATES = 10000
 _C.LOG_INTERVAL = 10
 _C.LOG_FILE = "train.log"
@@ -214,7 +214,7 @@ _C.RL.PPO.POLICY.BELIEFS.POLICY_INDEX = 0 # Used for comms policy
 
 _C.RL.PPO.POLICY.USE_SEMANTICS = False # Feed semantic to policy.
 _C.RL.PPO.POLICY.EVAL_GT_SEMANTICS = False # Experimental - we'll keep semantics on at test as well, just to see. Otherwise, default to rednet ckpt (specified below)
-_C.RL.PPO.POLICY.EVAL_SEMANTICS_CKPT = "/srv/share/jye72/rednet/rednet_semmap_mp3d_tuned.pth"
+_C.RL.PPO.POLICY.EVAL_SEMANTICS_CKPT = "pretrained_models/rednet_semmap_mp3d_tuned.pth"
 _C.RL.PPO.POLICY.EVAL_SEMANTICS_STABILIZE = False # Squash and upsample
 _C.RL.PPO.POLICY.EVAL_SEMANTICS_MUTE = False # Set to void
 
@@ -307,6 +307,42 @@ _C.RL.AUX_TASKS.PBL.subsample_rate = 0.2
 _C.RL.AUX_TASKS.PBL.sample = "random"
 
 _C.RL.AUX_TASKS.Dummy = CN()
+
+# Semantic Auxiliary Tasks
+_C.RL.SEM_AUX_TASKS = CN()
+_C.RL.SEM_AUX_TASKS.tasks = []
+
+_C.RL.SEM_AUX_TASKS.required_sensors = []
+_C.RL.SEM_AUX_TASKS.distribution = "uniform" # one-hot, TODO gaussian
+_C.RL.SEM_AUX_TASKS.entropy_coef = 0.0
+
+_C.RL.SEM_AUX_TASKS.ROOM = CN()
+_C.RL.SEM_AUX_TASKS.ROOM.loss_factor = 0.05
+_C.RL.SEM_AUX_TASKS.ROOM.subsample_rate = 0.2
+_C.RL.SEM_AUX_TASKS.ROOM.sample = "random"
+_C.RL.SEM_AUX_TASKS.ROOM.num_steps = 8
+_C.RL.SEM_AUX_TASKS.ROOM.hidden_size = 64
+
+
+_C.RL.SEM_AUX_TASKS.CPCS = CN()
+_C.RL.SEM_AUX_TASKS.CPCS.loss_factor = 0.15
+_C.RL.SEM_AUX_TASKS.CPCS.num_steps = 1
+_C.RL.SEM_AUX_TASKS.CPCS.subsample_rate = 0.2
+_C.RL.SEM_AUX_TASKS.CPCS.sample = "random"
+_C.RL.SEM_AUX_TASKS.CPCS.dropout = 0.0
+
+_C.RL.SEM_AUX_TASKS.CPCS_A = _C.RL.SEM_AUX_TASKS.CPCS.clone()
+_C.RL.SEM_AUX_TASKS.CPCS_A.num_steps = 2
+
+_C.RL.SEM_AUX_TASKS.CPCS_B = _C.RL.SEM_AUX_TASKS.CPCS.clone()
+_C.RL.SEM_AUX_TASKS.CPCS_B.num_steps = 4
+
+_C.RL.SEM_AUX_TASKS.CPCS_C = _C.RL.SEM_AUX_TASKS.CPCS.clone()
+_C.RL.SEM_AUX_TASKS.CPCS_C.num_steps = 8
+
+_C.RL.SEM_AUX_TASKS.CPCS_D = _C.RL.SEM_AUX_TASKS.CPCS.clone()
+_C.RL.SEM_AUX_TASKS.CPCS_D.num_steps = 16
+
 
 _C.RL.PPO.use_normalized_advantage = True
 _C.RL.PPO.hidden_size = 512

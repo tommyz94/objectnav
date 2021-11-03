@@ -163,13 +163,16 @@ class PPOTrainer(BaseRLTrainer):
                 "FP16 autocast requires PyTorch >= 1.7.1, please update your PyTorch"
             )
 
-    def _setup_auxiliary_tasks(self, aux_cfg, ppo_cfg, task_cfg, observation_space=None, is_eval=False, policy_encoders=["rgb", "depth"]):
+    def _setup_auxiliary_tasks(self, aux_cfg, ppo_cfg, task_cfg,
+                               observation_space=None, is_eval=False,
+                               policy_encoders=["rgb", "depth"]):
         r"""
             policy_encoders: If an auxiliary sensor is not used for the policy, we will make one
         """
         aux_task_strings = [task.lower() for task in aux_cfg.tasks]
         if "semanticcpca" in aux_task_strings and ppo_cfg.POLICY.USE_SEMANTICS:
-            raise Exception("I don't think using a separate semantic cpca task and feeding semantics into our main encoder are compatible")
+            raise Exception(
+                "I don't think using a separate semantic cpca task and feeding semantics into our main encoder are compatible")
         # Differentiate instances of tasks by adding letters
         aux_counts = {}
         for i, x in enumerate(aux_task_strings):
@@ -180,6 +183,65 @@ class PPOTrainer(BaseRLTrainer):
                 aux_counts[x] = 1
 
         logger.info(f"Auxiliary tasks: {aux_task_strings}")
+
+        num_recurrent_memories = 1
+        # Currently we have two places for policy name.. not good. Will delete once baselines are run
+        if self.config.RL.PPO.policy != "BASELINE":
+            raise Exception("I don't think you meant to set this policy")
+
+        policy = baseline_registry.get_policy(ppo_cfg.POLICY.name)
+
+        hidden_sizes = None
+        if policy.IS_MULTIPLE_BELIEF:
+            proposed_num_beliefs = ppo_cfg.POLICY.BELIEFS.NUM_BELIEFS
+            num_recurrent_memories = len(
+                aux_cfg.tasks) if proposed_num_beliefs == -1 else proposed_num_beliefs
+            if policy.IS_RECURRENT:
+                num_recurrent_memories += 1
+
+        init_aux_tasks = []
+        encoder_insts = {}
+        if not is_eval:
+            task_classes, encoder_classes = get_aux_task_classes(
+                aux_cfg)  # supervised is a dict
+            for encoder in encoder_classes:  # This is a dict of other encoders we want
+                if encoder in policy_encoders:  # If it already exists
+                    pass
+                encoder_insts[encoder] = encoder_classes[encoder](
+                    observation_space, ppo_cfg.hidden_size).to(self.device)
+            for i, task in enumerate(aux_cfg.tasks):
+                task_class = task_classes[i]
+                # * We previously constructed the extra encoders during aux task setup, but they are best constructed separately beforehand (for attachment to aux task AND policy)
+                # * We don't actually need it here, so we disable for now
+                # req_sensors = {
+                #     name: encoder_insts[name] for name in task_class.get_required_sensors(aux_cfg[task])
+                # }
+                # Currently the tasks which need a given encoder hold the module itself.
+                hidden_size = None  # will go to sensible default
+                aux_module = task_class(
+                    ppo_cfg, aux_cfg[task], task_cfg, self.device, \
+                    observation_space=observation_space,
+                    # sensor_encoders=req_sensors,
+                    hidden_size=hidden_size).to(self.device)
+                init_aux_tasks.append(aux_module)
+
+        return init_aux_tasks, num_recurrent_memories, aux_task_strings, encoder_insts
+
+    def _setup_semantic_auxiliary_tasks(self, aux_cfg, ppo_cfg, task_cfg, observation_space=None, is_eval=False, policy_encoders=["rgb", "depth"]):
+        r"""
+            policy_encoders: If an auxiliary sensor is not used for the policy, we will make one
+        """
+        aux_task_strings = [task.lower() for task in aux_cfg.tasks]
+        # Differentiate instances of tasks by adding letters
+        aux_counts = {}
+        for i, x in enumerate(aux_task_strings):
+            if x in aux_counts:
+                aux_task_strings[i] = f"{aux_task_strings[i]}_{aux_counts[x]}"
+                aux_counts[x] += 1
+            else:
+                aux_counts[x] = 1
+
+        logger.info(f"Semantic Auxiliary tasks: {aux_task_strings}")
 
         num_recurrent_memories = 1
         # Currently we have two places for policy name.. not good. Will delete once baselines are run
@@ -243,7 +305,9 @@ class PPOTrainer(BaseRLTrainer):
         ppo_cfg: Config,
         task_cfg: Config,
         aux_cfg: Config = None,
+        sem_aux_cfg: Config = None,
         aux_tasks=[],
+        sem_aux_tasks=[],
         policy_encoders=["rgb", "depth"],
         aux_encoders=None,
     ) -> None:
@@ -257,7 +321,8 @@ class PPOTrainer(BaseRLTrainer):
         """
         if len(aux_tasks) != 0 and len(aux_tasks) != len(aux_cfg.tasks):
             raise Exception(f"Policy specifies {len(aux_cfg.tasks)} tasks but {len(aux_tasks)} were initialized.")
-
+        if len(sem_aux_tasks) != 0 and len(sem_aux_tasks) != len(sem_aux_cfg.tasks):
+            raise Exception(f"Policy specifies {len(sem_aux_cfg.tasks)} tasks but {len(sem_aux_tasks)} were initialized.")
         logger.add_filehandler(self.config.LOG_FILE)
 
         observation_space = self.obs_space
@@ -284,6 +349,7 @@ class PPOTrainer(BaseRLTrainer):
             hidden_size=ppo_cfg.hidden_size,
             goal_sensor_uuid=task_cfg.GOAL_SENSOR_UUID,
             num_tasks=len(aux_cfg.tasks), # we pass this is in to support eval, where no aux modules are made
+            sem_num_tasks=len(sem_aux_cfg.tasks),
             additional_sensors=additional_sensors,
             embed_goal=embed_goal,
             device=self.device,
@@ -321,6 +387,7 @@ class PPOTrainer(BaseRLTrainer):
             eps=ppo_cfg.eps,
             max_grad_norm=ppo_cfg.max_grad_norm,
             aux_tasks=aux_tasks,
+            sem_aux_tasks=sem_aux_tasks,
             aux_cfg=aux_cfg,
             curiosity_cfg=ppo_cfg.CURIOSITY,
             curiosity_module=curiosity_module,
@@ -553,10 +620,12 @@ class PPOTrainer(BaseRLTrainer):
                 actions,
                 actions_log_probs,
                 recurrent_hidden_states,
+                recurrent_sem_hidden_states,
                 obs,
             ) = self.actor_critic.act(
                 step_observation,
-                rollouts.get_recurrent_states()[rollouts.step],
+                rollouts.get_recurrent_states()[0][rollouts.step],
+                rollouts.get_recurrent_states()[1][rollouts.step],
                 rollouts.prev_actions[rollouts.step],
                 rollouts.masks[rollouts.step],
                 return_features=True,
@@ -588,7 +657,7 @@ class PPOTrainer(BaseRLTrainer):
         batch = batch_obs(observations, device=self.device)
         if self.semantic_predictor is not None:
             batch["semantic"] = self.semantic_predictor(batch["rgb"], batch["depth"])
-            if ppo_cfg.POLICY.EVAL_SEMANTICS_CKPT == "/srv/share/jye72/rednet/rednet_semmap_mp3d_40.pth":
+            if ppo_cfg.POLICY.EVAL_SEMANTICS_CKPT == "./pretrained_models/rednet_semmap_mp3d_40.pth":
                 batch["semantic"] -= 1
         batch = apply_obs_transforms_batch(batch, self.obs_transforms)
 
@@ -658,6 +727,7 @@ class PPOTrainer(BaseRLTrainer):
         rollouts.insert(
             batch,
             recurrent_hidden_states,
+            recurrent_sem_hidden_states,
             actions,
             actions_log_probs, # b x k x 1
             values, # b x k x 1
@@ -678,7 +748,8 @@ class PPOTrainer(BaseRLTrainer):
             }
             next_value = self.actor_critic.get_value(
                 last_observation,
-                rollouts.get_recurrent_states()[rollouts.step],
+                rollouts.get_recurrent_states()[0][rollouts.step],
+                rollouts.get_recurrent_states()[1][rollouts.step],
                 rollouts.prev_actions[rollouts.step],
                 rollouts.masks[rollouts.step],
             ).detach()
@@ -701,8 +772,11 @@ class PPOTrainer(BaseRLTrainer):
             action_loss,
             dist_entropy,
             aux_task_losses,
+            sem_aux_task_losses,
             aux_dist_entropy,
+            sem_aux_dist_entropy,
             aux_weights,
+            sem_aux_weights,
             inv_curiosity,
             fwd_curiosity,
         ) = self.agent.update(
@@ -718,8 +792,11 @@ class PPOTrainer(BaseRLTrainer):
             action_loss,
             dist_entropy,
             aux_task_losses,
+            sem_aux_task_losses,
             aux_dist_entropy,
+            sem_aux_dist_entropy,
             aux_weights,
+            sem_aux_weights,
             inv_curiosity,
             fwd_curiosity,
         )
@@ -778,7 +855,7 @@ class PPOTrainer(BaseRLTrainer):
                 observation_space=observation_space, policy_encoders=policy_encoders_map)
 
         self._setup_actor_critic_agent(
-            ppo_cfg, task_cfg, aux_cfg,
+            ppo_cfg, task_cfg, aux_cfg, sem_aux_cfg,
             init_aux_tasks,
             aux_encoders=aux_encoder_insts,
             policy_encoders=policy_encoders_map
@@ -934,7 +1011,7 @@ class PPOTrainer(BaseRLTrainer):
         self.envs.close()
 
     def project_out(
-        self, states, projection_path='/srv/share/jye72/base-full_timesteps.pth'
+        self, states, projection_path='./base-full_timesteps.pth'
     ):
         r"""
         # states l x b x k x h
@@ -1373,7 +1450,7 @@ class PPOTrainer(BaseRLTrainer):
         if self.semantic_predictor is not None:
             # batch["gt_semantic"] = batch["semantic"]
             batch["semantic"] = self.semantic_predictor(batch["rgb"], batch["depth"])
-            if ppo_cfg.POLICY.EVAL_SEMANTICS_CKPT == "/srv/share/jye72/rednet/rednet_semmap_mp3d_40.pth":
+            if ppo_cfg.POLICY.EVAL_SEMANTICS_CKPT == "./pretrained_models/rednet_semmap_mp3d_40.pth":
                 batch["semantic"] -= 1
 
         batch = apply_obs_transforms_batch(batch, self.obs_transforms)
@@ -1510,7 +1587,7 @@ class PPOTrainer(BaseRLTrainer):
             if self.semantic_predictor is not None:
                 # batch["gt_semantic"] = batch["semantic"]
                 batch["semantic"] = self.semantic_predictor(batch["rgb"], batch["depth"])
-                if ppo_cfg.POLICY.EVAL_SEMANTICS_CKPT == "/srv/share/jye72/rednet/rednet_semmap_mp3d_40.pth":
+                if ppo_cfg.POLICY.EVAL_SEMANTICS_CKPT == "./pretrained_models/rednet_semmap_mp3d_40.pth":
                     batch["semantic"] -= 1
                 if len(self.config.VIDEO_OPTION) > 0:
                     for i in range(batch["semantic"].size(0)):
@@ -1705,6 +1782,7 @@ class PPOTrainer(BaseRLTrainer):
         entropy: torch.tensor,
         losses: List[torch.tensor],
         aux_losses,
+        sem_aux_losses,
         count_steps,
         elapsed_steps,
         update,
@@ -1713,7 +1791,9 @@ class PPOTrainer(BaseRLTrainer):
         t_start,
         window_episode_stats,
         aux_weights,
-        aux_task_strings
+        sem_aux_weights,
+        aux_task_strings,
+        sem_aux_task_strings
     ):
         r"""
             Add stats (torch values that we're too lazy to aggregate),
@@ -1747,8 +1827,10 @@ class PPOTrainer(BaseRLTrainer):
         if len(value_losses.size()) > 0:
             for i in range(1, value_losses.size(0)):
                 losses_strs.extend([f"value_{i}", f"policy_{i}"])
-        losses = [val.item() for pair in zip(value_losses, policy_losses) for val in pair] + aux_losses
+        losses = [val.item() for pair in zip(value_losses, policy_losses) for val in pair] + aux_losses + sem_aux_losses
         losses_strs.extend(aux_task_strings)
+        losses_strs.extend(sem_aux_task_strings)
+
 
         writer.add_scalars(
             "losses",
@@ -1762,13 +1844,19 @@ class PPOTrainer(BaseRLTrainer):
                 {k: l for l, k in zip(aux_weights, aux_task_strings)},
                 count_steps,
             )
+        if aux_weights is not None:
+            writer.add_scalars(
+                "sem_aux_weights",
+                {k: l for l, k in zip(sem_aux_weights, sem_aux_task_strings)},
+                count_steps,
+            )
 
         # Log stats
         if update > 0 and update % self.config.LOG_INTERVAL == 0:
             formatted_losses = [f"{s}: {l:.3g}" for s, l in zip(losses_strs, losses)]
             logger.info(
-                "update: {}\t {} \t aux_entropy {:.3g}\t inv curious {:.3g} fwd curious {:.3g}".format(
-                    update, formatted_losses, stats["aux_entropy"], stats["inv_curiosity_loss"], stats["fwd_curiosity_loss"]
+                "update: {}\t {} \t aux_entropy {:.3g} \t sem_aux_entropy {:.3g} \t inv curious {:.3g} fwd curious {:.3g}".format(
+                    update, formatted_losses, stats["aux_entropy"], stats["sem_aux_entropy"], stats["inv_curiosity_loss"], stats["fwd_curiosity_loss"]
                 )
             )
             logger.info(

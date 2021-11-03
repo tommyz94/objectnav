@@ -73,9 +73,9 @@ class Policy(nn.Module):
         critic_head_layers = getattr(config, "CRITIC_HEAD_LAYERS", 1)
 
         self.action_distribution = CategoricalNet(
-            self.net.output_size, self.dim_actions, layers=actor_head_layers
+            self.net.output_size*2, self.dim_actions, layers=actor_head_layers
         )
-        self.critic = CriticHead(self.net.output_size, layers=critic_head_layers)
+        self.critic = CriticHead(self.net.output_size*2, layers=critic_head_layers)
         if "rgb" in observation_space.spaces:
             self.running_mean_and_var = RunningMeanAndVar(
                 observation_space.spaces["rgb"].shape[-1]

@@ -37,7 +37,7 @@ TASK:
   POSSIBLE_ACTIONS: ["STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "LOOK_UP", "LOOK_DOWN"]
   SUCCESS_DISTANCE: 0.1
 
-  SENSORS: ['OBJECTGOAL_SENSOR', 'COMPASS_SENSOR', 'GPS_SENSOR']
+  SENSORS: ['OBJECTGOAL_SENSOR', 'COMPASS_SENSOR', 'GPS_SENSOR', 'ROOM_CATEGORY_SENSOR']
   GOAL_SENSOR_UUID: objectgoal
 
   MEASUREMENTS:
@@ -62,6 +62,6 @@ TASK:
     ATTENUATION: 0.995
 DATASET:
   TYPE: ObjectNav-v1
-  SPLIT: train
+  SPLIT: train_mini
   DATA_PATH: "data/datasets/objectnav/mp3d/v1/{split}/{split}.json.gz"
   SCENES_DIR: "data/scene_datasets/"

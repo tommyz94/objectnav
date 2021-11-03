@@ -22,6 +22,7 @@ class RolloutStorage:
         recurrent_hidden_state_size,
         num_recurrent_layers=1,
         num_recurrent_memories=1,
+        num_sem_recurrent_memories=0,
         num_policy_heads=1,
         metrics=[], # list of metric scalars we want to track
     ):
@@ -43,11 +44,20 @@ class RolloutStorage:
         # * Note: these modules are hidden in the rollout, i.e. if an architecture uses one module the rollout API does not expect the module dimension
         # * This is to be compatible with baseline architectures
         self.num_modules = num_recurrent_memories
+        self.num_sem_modules = num_sem_recurrent_memories
         self.recurrent_hidden_states = torch.zeros(
             num_steps + 1,
             num_recurrent_layers,
             num_envs,
             self.num_modules,
+            recurrent_hidden_state_size,
+        )
+
+        self.recurrent_sem_hidden_states = torch.zeros(
+            num_steps + 1,
+            num_recurrent_layers,
+            num_envs,
+            self.num_sem_modules,
             recurrent_hidden_state_size,
         )
 
@@ -87,6 +97,7 @@ class RolloutStorage:
             self.observations[sensor] = self.observations[sensor].to(device)
 
         self.recurrent_hidden_states = self.recurrent_hidden_states.to(device)
+        self.recurrent_sem_hidden_states = self.recurrent_sem_hidden_states.to(device)
         self.rewards = self.rewards.to(device)
         self.value_preds = self.value_preds.to(device)
         self.returns = self.returns.to(device)
@@ -99,6 +110,7 @@ class RolloutStorage:
 
     def to_fp16(self):
         self.recurrent_hidden_states = self.recurrent_hidden_states.to(dtype=torch.float16)
+        self.recurrent_sem_hidden_states = self.recurrent_sem_hidden_states.to(dtype=torch.float16)
         for sensor in self.observations:
             reading = self.observations[sensor]
             if reading.dtype == torch.float32:
@@ -108,6 +120,7 @@ class RolloutStorage:
         self,
         observations,
         recurrent_hidden_states,
+        recurrent_sem_hidden_states,
         actions,
         action_log_probs, # b x k x 1
         value_preds, # b x k x 1
@@ -125,6 +138,9 @@ class RolloutStorage:
         self.recurrent_hidden_states[self.step + 1].copy_(
             recurrent_hidden_states
         )
+        self.recurrent_sem_hidden_states[self.step + 1].copy_(
+            recurrent_sem_hidden_states
+        )
         self.actions[self.step].copy_(actions)
         self.prev_actions[self.step + 1].copy_(actions)
         self.action_log_probs[self.step].copy_(action_log_probs)
@@ -139,7 +155,7 @@ class RolloutStorage:
     def get_recurrent_states(self):
         if self.num_modules == 1:
             return self.recurrent_hidden_states.squeeze(-2)
-        return self.recurrent_hidden_states
+        return self.recurrent_hidden_states, self.recurrent_sem_hidden_states
 
     def after_update(self):
         for sensor in self.observations:
@@ -149,6 +165,9 @@ class RolloutStorage:
 
         self.recurrent_hidden_states[0].copy_(
             self.recurrent_hidden_states[self.step]
+        )
+        self.recurrent_sem_hidden_states[0].copy_(
+            self.recurrent_sem_hidden_states[self.step]
         )
         self.masks[0].copy_(self.masks[self.step])
         self.prev_actions[0].copy_(self.prev_actions[self.step])
@@ -204,6 +223,7 @@ class RolloutStorage:
             observations_batch = defaultdict(list)
 
             recurrent_hidden_states_batch = []
+            recurrent_sem_hidden_states_batch = []
             actions_batch = []
             prev_actions_batch = []
             value_preds_batch = []
@@ -223,6 +243,11 @@ class RolloutStorage:
 
                 recurrent_hidden_states_batch.append(
                     self.recurrent_hidden_states[0, :, ind] # add the first hidden state
+                )
+
+                recurrent_sem_hidden_states_batch.append(
+                    self.recurrent_sem_hidden_states[0, :, ind]
+                    # add the first hidden state
                 )
 
                 actions_batch.append(self.actions[: self.step, ind])
@@ -259,6 +284,7 @@ class RolloutStorage:
 
             # States is a (num_recurrent_layers, N, k, -1) tensor
             recurrent_hidden_states_batch = torch.stack(recurrent_hidden_states_batch, 1)
+            recurrent_sem_hidden_states_batch = torch.stack(recurrent_sem_hidden_states_batch, 1)
             if self.num_modules == 1:
                 recurrent_hidden_states_batch = recurrent_hidden_states_batch.squeeze(-2)
 
@@ -284,6 +310,7 @@ class RolloutStorage:
             yield (
                 observations_batch,
                 recurrent_hidden_states_batch,
+                recurrent_sem_hidden_states_batch,
                 actions_batch,
                 prev_actions_batch,
                 value_preds_batch,

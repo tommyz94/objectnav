@@ -101,6 +101,11 @@ _C.TASK.OBJECTGOAL_SENSOR.TYPE = "ObjectGoalSensor"
 _C.TASK.OBJECTGOAL_SENSOR.GOAL_SPEC = "TASK_CATEGORY_ID"
 _C.TASK.OBJECTGOAL_SENSOR.GOAL_SPEC_MAX_VAL = 50
 # -----------------------------------------------------------------------------
+# ROOM_CATEGORY SENSOR
+# -----------------------------------------------------------------------------
+_C.TASK.ROOM_CATEGORY_SENSOR = CN()
+_C.TASK.ROOM_CATEGORY_SENSOR.TYPE = "RoomCategorySensor"
+# -----------------------------------------------------------------------------
 # IMAGEGOAL SENSOR
 # -----------------------------------------------------------------------------
 _C.TASK.IMAGEGOAL_SENSOR = CN()
